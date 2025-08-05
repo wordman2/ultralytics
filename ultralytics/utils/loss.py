@@ -14,6 +14,31 @@ from ultralytics.utils.torch_utils import autocast
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
+dirt_regions = [
+    [1524.4484, 299.3051, 1542.9252, 324.0077],
+    [1850.6511, 346.9793, 1869.5945, 366.7969],
+    [1854.6447, 349.7901, 1867.9561 , 361.4367],
+    [1526.9149, 302.0323, 1539.0952 , 317.9285],
+    [1309.3053, 1355.2832, 1329.7598 , 1374.8341],
+    [717.6982 , 38.7896 , 736.7984 , 56.4425 ],
+    [2010.9865, 569.9052, 2028.4943 , 585.2700],
+    [1570, 34.4106, 1580 , 45.8527],
+    [2352.2624, 559.8592, 2369.2624, 571.8087]
+]
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+orig_img_size = (2590,1952)
+imgsz = torch.tensor([1952, 1952], device=device)  # YOLOv8 image size
+# Convert dirt_regions to a tensor
+dirt_regions_tensor = torch.tensor(dirt_regions, device=device, dtype=imgsz.dtype)  # shape (N, 4)
+# Compute scaling factors for each coordinate
+scale = torch.tensor([
+    orig_img_size[0] / imgsz[0],  # x1
+    orig_img_size[1] / imgsz[1],  # y1
+    orig_img_size[0] / imgsz[0],  # x2
+    orig_img_size[1] / imgsz[1],  # y2
+], device=device, dtype=imgsz.dtype)
+# Scale dirt regions to yolo's imgsize
+ignored = dirt_regions_tensor * scale  # shape (N, 4)
 
 class VarifocalLoss(nn.Module):
     """
@@ -278,7 +303,29 @@ class v8DetectionLoss:
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
+        
+        # ======= IGNORE LOGIC =======
+        
+        anchor_points_img_scaled = anchor_points*stride_tensor
 
+        
+        for i in range(batch_size):
+            ap = anchor_points_img_scaled.unsqueeze(1)
+            ir = ignored.unsqueeze(0)
+            inside =(
+                (ap[..., 0] >= ir[..., 0]) & (ap[..., 0] <= ir[..., 2]) &
+                (ap[..., 1] >= ir[..., 1]) & (ap[..., 1] <= ir[..., 3])
+            )
+
+            ignore_mask = inside.any(dim=1)
+
+            # fg_mask == foreground mask
+            fg_mask[i] &= ~ignore_mask  # apply ignore mask
+
+            # Optionally zero out ignored target_scores to avoid obj/cls loss
+            target_scores[i][ignore_mask] = 0.0
+
+        # ======= LOSS =======
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
